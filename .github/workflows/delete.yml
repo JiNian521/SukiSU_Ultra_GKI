@@ -1,4 +1,4 @@
-name: 清理工作流运行记录和缓存
+name: Workflow and Cache Cleanup
 
 on:
   workflow_dispatch:
@@ -7,12 +7,22 @@ on:
         type: choice
         description: '清理的工作流名称'
         required: true
-        default: 'Build OnePlus_SukiSU Ultra All'
+        default: 'Build All OnePlus Kernels'
         options:
-          - Build OnePlus_SukiSU Ultra All
+          - Build All OnePlus Kernels
           - CAll Build Start UP
           - Build TEST
           - Build TEST2
+      cache_mode:
+        type: choice
+        description: '缓存清理类型'
+        required: false
+        default: 'none'
+        options:
+          - none
+          - all
+          - ccache
+          - apt-cache
       count:
         description: '最多访问的运行次数'
         required: false
@@ -37,11 +47,6 @@ on:
         required: false
         type: boolean
         default: false
-      clear_cache:
-        description: '是否删除所有ccache缓存？'
-        required: false
-        type: boolean
-        default: false
       cancel_all:
         description: '是否一键取消指定工作流的所有运行？'
         required: false
@@ -54,7 +59,10 @@ permissions:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
-
+    if: ${{ inputs.cancel_all
+     || inputs.delete_failed
+     || inputs.delete_success
+     || inputs.delete_cancelled }}
     steps:
       - name: 安装环境
         run: |
@@ -79,7 +87,12 @@ jobs:
           set -e
 
           echo "查找工作流 \"$WORKFLOW_NAME\" 的 ID..."
-          WORKFLOW_ID=$(gh api repos/$REPO/actions/workflows | jq -r ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
+          WORKFLOWS_JSON=$(gh api repos/$REPO/actions/workflows || true)
+          if ! echo "$WORKFLOWS_JSON" | jq -e '.workflows | type=="array"' >/dev/null 2>&1; then
+            echo "❌ 无法获取 workflows（GitHub API 非 JSON）"
+            exit 1
+          fi
+          WORKFLOW_ID=$(echo "$WORKFLOWS_JSON" | jq -r ".workflows[] | select(.name == \"$WORKFLOW_NAME\") | .id")
           if [ -z "$WORKFLOW_ID" ]; then
             echo "未找到工作流 \"$WORKFLOW_NAME\"，退出。"
             exit 1
@@ -90,7 +103,12 @@ jobs:
           PAGE=1
           ALL_RUNS="[]"
           while true; do
-            RESP=$(gh api "repos/$REPO/actions/workflows/$WORKFLOW_ID/runs?per_page=$PER_PAGE&page=$PAGE")
+            RESP=$(gh api "repos/$REPO/actions/workflows/$WORKFLOW_ID/runs?per_page=$PER_PAGE&page=$PAGE" || true)
+            if ! echo "$RESP" | jq -e '.workflow_runs | type=="array"' >/dev/null 2>&1; then
+              echo "⚠️ runs API 返回非 JSON，停止分页"
+              break
+            fi
+
             RUNS=$(echo "$RESP" | jq '.workflow_runs')
             COUNT_THIS_PAGE=$(echo "$RUNS" | jq 'length')
             if [ "$COUNT_THIS_PAGE" -eq 0 ]; then break; fi
@@ -103,7 +121,7 @@ jobs:
           if [[ "$CANCEL_ALL" == "true" ]]; then
             echo "开始取消进行中或排队中的运行..."
             CANCEL_COUNT=0
-            echo "$ALL_RUNS" | jq -c '.[] | select(.status == "in_progress" or .status == "queued")' | while read run; do
+            echo "$ALL_RUNS" | jq -c '.[] | select((.status == "in_progress") or (.status == "queued"))' | while read run; do
               ID=$(echo "$run" | jq -r '.id')
               if [[ "$ID" == "$CURRENT_RUN_ID" ]]; then continue; fi
               echo "取消运行 ID: $ID"
@@ -136,7 +154,7 @@ jobs:
           done
 
           echo "清理本工作流运行记录（排除当前运行）..."
-          SELF_WORKFLOW_ID=$(gh api repos/$REPO/actions/workflows | jq -r '.workflows[] | select(.name == "清理工作流运行记录和缓存") | .id')
+          SELF_WORKFLOW_ID=$(gh api repos/$REPO/actions/workflows | jq -r '.workflows[] | select(.name == "Workflow and Cache Cleanup") | .id')
           if [ -n "$SELF_WORKFLOW_ID" ]; then
             SELF_RUNS=$(gh api "repos/$REPO/actions/workflows/$SELF_WORKFLOW_ID/runs?per_page=50" | jq -c '.workflow_runs[]')
             echo "$SELF_RUNS" | while read run; do
@@ -149,17 +167,20 @@ jobs:
 
   clean-caches:
     runs-on: ubuntu-latest
-    needs: cleanup
-    if: ${{ inputs.clear_cache == true || inputs.clear_cache == 'true' }}
+    if: ${{ inputs.cache_mode != 'none' }}
     permissions:
       actions: write
     steps:
-      - name: 删除并重置缓存
+      - name: 根据模式清理缓存
         uses: actions/github-script@v6
         with:
           script: |
             const { owner, repo } = context.repo;
+            const mode = process.env.CACHE_MODE || '${{ inputs.cache_mode }}';
+            console.log(`🔹 当前缓存清理模式: ${mode}`);
+
             let totalDeleted = 0;
+            let totalFound = 0;
             let page = 1;
 
             while (true) {
@@ -167,21 +188,43 @@ jobs:
                 owner,
                 repo,
                 per_page: 100,
-                page: page
+                page
               });
 
               const caches = res.data.actions_caches;
               if (!caches || caches.length === 0) break;
 
               for (const cache of caches) {
-                if (cache.key.startsWith('ccache-')) {
-                  console.log(`删除缓存: ${cache.key}`);
-                  await github.rest.actions.deleteActionsCacheById({
-                    owner,
-                    repo,
-                    cache_id: cache.id
-                  });
-                  totalDeleted++;
+                const key = cache.key;
+                let matched = false;
+
+                switch (mode) {
+                  case 'all':
+                    matched = true;
+                    break;
+                  case 'ccache':
+                    matched = key.startsWith('ccache-');
+                    break;
+                  case 'apt-cache':
+                    matched = key.includes('apt-cache') || key.includes('apt');
+                    break;
+                  default:
+                    matched = false;
+                }
+
+                if (matched) {
+                  totalFound++;
+                  console.log(`删除缓存: ${key}`);
+                  try {
+                    await github.rest.actions.deleteActionsCacheById({
+                      owner,
+                      repo,
+                      cache_id: cache.id
+                    });
+                    totalDeleted++;
+                  } catch (err) {
+                    console.log(`删除缓存失败: ${key}`);
+                  }
                 }
               }
 
@@ -189,4 +232,8 @@ jobs:
               page++;
             }
 
-            console.log(`共删除缓存数量: ${totalDeleted}`);
+            if (totalFound === 0) {
+              console.log("没有找到符合条件的缓存。");
+            } else {
+              console.log(`共找到 ${totalFound} 个缓存，成功删除 ${totalDeleted} 个。`);
+            }
